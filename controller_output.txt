@@ -1,0 +1,2933 @@
+import { getTursoClient } from './config/db.js';
+const router = require('./routes/router');
+
+// The new beginning 
+
+export default {
+	async fetch(request, env) {
+		// Create the database client
+		const dbClient = getTursoClient(env);
+
+
+		// Parse the request URL
+		// const { pathname } = new URL(request.url);
+		// const type = request.method;
+
+		// Handle the request via the router
+		return router.handleRequest(request, env, dbClient);
+	},
+};
+
+import { createClient } from "@libsql/client";
+
+
+export const getTursoClient = (env) => {
+    return createClient({
+        url: env.TURSO_URL,
+        authToken: env.TURSO_AUTH_TOKEN,
+    }
+    );
+};
+
+const bcrypt = require('bcryptjs'); // Use bcryptjs for hashing passwords
+const jwt = require('jsonwebtoken'); // Use jsonwebtoken for creating JWT tokens
+const xss = require('xss'); // npm install xss
+
+
+async function signup(request, dbClient) {
+    try {
+        // 1. Extract and Validate User Data
+        const { username, email, password, phone_number, role, first_name, last_name } = await request.json();
+
+        if (!username || !email || !password) {
+            return new Response(JSON.stringify({ error: "Missing required fields: username, email, and password." }, null, 2), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        if (!isValidEmail(email)) {
+            return new Response(JSON.stringify({ error: "Invalid email format." }, null, 2), { status: 400, headers: { "Content-Type": "application/json" } });
+        }
+
+        function isValidEmail(email) {
+            return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+        }
+
+        // 2. Sanitize Inputs (Prevent XSS)
+        const sanitizedUsername = xss(username);
+        const sanitizedEmail = xss(email);
+        const sanitizedPhoneNumber = phone_number ? xss(phone_number) : null;
+        const sanitizedRole = role ? xss(role) : 'user';
+        const sanitizedFirstName = first_name ? xss(first_name) : null;
+        const sanitizedLastName = last_name ? xss(last_name) : null;
+
+        // 3. Check for Existing User (Username/Email)
+        let existingUserResult;
+        try {
+            const existingUserQuery = `SELECT id FROM Users WHERE username = ? OR email = ?`;
+
+            console.log("signup: Checking for existing user with query:", existingUserQuery);
+
+            try {
+                existingUserResult = await dbClient.execute(existingUserQuery, [sanitizedUsername, sanitizedEmail]);
+                console.log("signup: executeDbQuery: Query executed successfully. Result:", existingUserResult);
+            } catch (executeDbQueryError) {
+                console.error("signup: executeDbQuery: Database query failed:", executeDbQueryError);
+                throw executeDbQueryError;
+            }
+
+            if (existingUserResult && existingUserResult.results && existingUserResult.results.length > 0) {
+                return new Response(JSON.stringify({ error: "Username or email already exists." }, null, 2), { status: 409, headers: { "Content-Type": "application/json" } });
+            }
+        } catch (dbError) {
+            console.error("signup: Error checking for existing user:", dbError);
+            return new Response(JSON.stringify({ error: "Database error checking for existing user.", details: dbError.message || String(dbError) }, null, 2), { status: 500, headers: { "Content-Type": "application/json" } });
+        }
+
+        // 4. Hash Password
+        let hashedPassword;
+        try {
+            hashedPassword = await bcrypt.hash(password, 12);
+        } catch (hashError) {
+            console.error("signup: Password hashing error:", hashError);
+            return new Response(JSON.stringify({ error: "Error hashing password.", details: hashError.message || String(hashError) }, null, 2), { status: 500, headers: { "Content-Type": "application/json" } });
+        }
+
+        // 5. Insert New User
+        try {
+            const insertUserQuery = `
+                INSERT INTO Users (username, email, phone_number, password, role, first_name, last_name)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            `;
+            console.log("signup: Inserting new user with query:", insertUserQuery);
+
+            try {
+                await dbClient.execute(insertUserQuery, [sanitizedUsername, sanitizedEmail, sanitizedPhoneNumber, hashedPassword, sanitizedRole, sanitizedFirstName, sanitizedLastName]);
+                console.log("signup: executeDbQuery: Query executed successfully.");
+            } catch (executeDbQueryError) {
+                console.error("signup: executeDbQuery: Database query failed:", executeDbQueryError);
+                throw executeDbQueryError;
+            }
+
+        } catch (dbInsertError) {
+            console.error("signup: Error inserting new user:", dbInsertError);
+            return new Response(JSON.stringify({ error: "Failed to create user in database.", details: dbInsertError.message || String(dbInsertError) }, null, 2), { status: 500, headers: { "Content-Type": "application/json" } });
+        }
+
+        // 6. Success!
+        return new Response(JSON.stringify({ message: "User created successfully!" }, null, 2), { status: 201, headers: { "Content-Type": "application/json" } });
+
+    } catch (error) {
+        console.error("signup: General signup error:", error);
+        return new Response(JSON.stringify({ error: "Failed to create user.", details: error.message || String(error) }, null, 2), { status: 500, headers: { "Content-Type": "application/json" } });
+    }
+}
+
+async function login(request, dbClient, env) {
+    try {
+        // Extract login credentials from request
+        console.log(request)
+        const { username, email, password } = await request.json();
+
+        // Validate required fields
+        if ((!username && !email) || !password) {
+            return new Response(JSON.stringify({
+                error: "Missing required fields: username/email or password."
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        // Build query dynamically based on provided field (username or email)
+        const query = username
+            ? 'SELECT * FROM Users WHERE username = ?'
+            : 'SELECT * FROM Users WHERE email = ?';
+        const identifier = username || email;
+
+        // Query database for the user
+        const result = await dbClient.execute(query, [identifier]);
+
+        // Check if the user exists
+        if (result.rows.length === 0) {
+            return new Response(JSON.stringify({
+                error: "User not found"
+            }), {
+                status: 404,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        // Compare the provided password with the stored hashed password
+        const user = result.rows[0];
+        const passwordMatch = await bcrypt.compare(password, user.password);
+
+        if (!passwordMatch) {
+            return new Response(JSON.stringify({
+                error: "Invalid password"
+            }), {
+                status: 401,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        // Generate a JWT token
+        const token = jwt.sign(
+            { userId: user.id, username: user.username, role: user.role },
+            env.JWT_SECRET,
+            { expiresIn: env.JWT_EXPIRY } // Token expiration time (e.g. s, h, m )
+        );
+
+        // Successful login response
+        return new Response(JSON.stringify({
+            message: "Login successful",
+            token,
+            userId: user.id,
+            username: user.username,
+            role: user.role
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+
+    } catch (error) {
+        // Handle any server error
+        return new Response(JSON.stringify({
+            error: "Login failed",
+            details: error.message,
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+}
+
+module.exports = { login, signup };
+import validateSession from "../utils/validateSession.controller";
+
+/**
+ * Utility function to generate a URL-friendly slug from a title.
+ * @param {string} title - The title to convert to a slug.
+ */
+const createSlug = (title) => {
+    if (!title) {
+        throw new Error("Title is required to create a slug.");
+    }
+
+    return title
+        .toLowerCase()
+        .trim()
+        .replace(/[^a-z0-9\s-]/g, '')
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-');
+};
+
+/**
+ * Utility function to parse a comma-separated list of image names.
+ */
+const parseImageList = (imageList) => {
+    return imageList ? imageList.split(',').map(name => name.trim()) : [];
+};
+
+/**
+ * Utility function to truncate text.
+ */
+const truncateText = (text, limit = 100) => {
+    if (!text) return "";
+    return text.length > limit ? text.substring(0, limit) + "..." : text;
+};
+
+/**
+ * Public route to fetch published blog posts in truncated form.
+ */
+const getPublishedBlogs = async (dbClient, env, request) => {
+    try {
+        const url = new URL(request.url);
+        const limit = parseInt(url.searchParams.get('limit') || '10', 10);
+        const offset = parseInt(url.searchParams.get('offset') || '0', 10);
+
+        if (!dbClient || typeof dbClient.execute !== 'function') {
+            throw new Error("dbClient is not a valid database client, check configuration and imports")
+        }
+
+        const query = `
+            SELECT b.post_id, b.title, b.slug, b.excerpt, b.created_at,
+                   b.featured_image_name AS thumbnail_image_name
+            FROM BlogPosts b
+            WHERE b.status = 'published'
+            ORDER BY b.created_at DESC
+            LIMIT ? OFFSET ?;
+        `;
+
+        const result = await dbClient.execute(query, [limit, offset]);
+
+        const blogs = result.rows.map(row => ({
+            post_id: row.post_id,
+            title: row.title,
+            slug: row.slug,
+            excerpt: truncateText(row.excerpt, 150), // Truncate the excerpt
+            created_at: row.created_at,
+            thumbnail_image: row.thumbnail_image_name ? `${env.R2_PUBLIC_URL}/${row.thumbnail_image_name}` : null, // construct the url
+        }));
+
+        return new Response(JSON.stringify({
+            message: "Published blog posts fetched successfully!",
+            blogCount: blogs.length,
+            blogs,
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        console.error("Error fetching published blog posts:", error);
+        return new Response(JSON.stringify({
+            error: "Failed to fetch published blog posts",
+            details: error.message
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+const getPublishedBlogById = async (id, dbClient, env) => {
+    try {
+        const postQuery = `
+        SELECT b.*
+        FROM BlogPosts b
+        WHERE b.post_id = ? AND b.status = 'published';
+        `;
+        const result = await dbClient.execute(postQuery, [id]);
+
+        if (result.rows.length === 0) {
+            return new Response(JSON.stringify({
+                error: "Blog post not found."
+            }), {
+                status: 404,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        const post = result.rows[0];
+        return new Response(JSON.stringify({
+            message: "Blog post fetched successfully!",
+            post: {
+                ...post,
+                featured_image: post.featured_image_name ? `${env.R2_PUBLIC_URL}/${post.featured_image_name}` : null, // Construct the URL
+            },
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to fetch blog post",
+            details: error.message
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+/**
+ * Fetch all blog posts along with their thumbnail and extra images.
+ */
+const getAllBlogs = async (dbClient, env) => {
+    try {
+        if (!dbClient || typeof dbClient.execute !== 'function') {
+            throw new Error("dbClient is not a valid database client, check configuration and imports")
+        }
+
+        const query = `
+            SELECT b.post_id, b.title, b.slug, b.excerpt, b.created_at, b.status,
+                   b.featured_image_name AS thumbnail_image_name, b.extra_images_list
+            FROM BlogPosts b
+            ORDER BY b.created_at DESC;
+        `;
+        const result = await dbClient.execute(query);
+
+        // Fetch extra images for each blog post
+        const blogs = await Promise.all(result.rows.map(async (row) => {
+            const extraImageNames = parseImageList(row.extra_images_list);
+
+            // Fetch URLs for extra images from R2
+            const extraImages = await Promise.all(extraImageNames.map(async (imageName) => {
+                return {
+                    image_name: imageName,
+                    image_url: imageName ? `${env.R2_PUBLIC_URL}/${imageName}` : null, // Construct the URL
+                };
+            }));
+            return {
+                post_id: row.post_id,
+                title: row.title,
+                slug: row.slug,
+                excerpt: row.excerpt,
+                created_at: row.created_at,
+                status: row.status,
+                thumbnail_image: row.thumbnail_image_name ? `${env.R2_PUBLIC_URL}/${row.thumbnail_image_name}` : null, // construct the url
+                extra_images: extraImages,
+            };
+        }));
+
+        return new Response(JSON.stringify({
+            message: "Blog posts fetched successfully!",
+            blogCount: blogs.length,
+            blogs,
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to fetch blog posts",
+            details: error.message
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+/**
+ * Fetch a single blog post by ID along with its images.
+ */
+const getBlogById = async (id, dbClient, env) => {
+    try {
+        const postQuery = `
+            SELECT b.*
+            FROM BlogPosts b
+            WHERE b.post_id = ?;
+        `;
+        const result = await dbClient.execute(postQuery, [id]);
+
+        if (result.rows.length === 0) {
+            return {
+                status: 404,
+                body: JSON.stringify({ error: "Blog post not found." }),
+                headers: { "Content-Type": "application/json" },
+            };
+        }
+
+        const post = result.rows[0];
+        const extraImageNames = parseImageList(post.extra_images_list);
+
+        // Fetch URLs for extra images from R2
+        const extraImages = await Promise.all(extraImageNames.map(async (imageName) => {
+            return {
+                image_name: imageName,
+                image_url: imageName ? `${env.R2_PUBLIC_URL}/${imageName}` : null, // Construct the URL
+            };
+        }));
+
+        return {
+            status: 200,
+            body: JSON.stringify({
+                message: "Blog post fetched successfully!",
+                post: {
+                    ...post,
+                    featured_image: post.featured_image_name ? `${env.R2_PUBLIC_URL}/${post.featured_image_name}` : null, // Construct the URL
+                    extra_images: extraImages,
+                },
+            }),
+            headers: { "Content-Type": "application/json" },
+        };
+    } catch (error) {
+        console.error("Error fetching blog post by ID:", error);
+        return {
+            status: 500,
+            body: JSON.stringify({
+                error: "Failed to fetch blog post",
+                details: error.message
+            }),
+            headers: { "Content-Type": "application/json" },
+        };
+    }
+};
+
+/**
+ * Create a new blog post with authorization, including extra images.
+ */
+const createBlog = async (request, dbClient, env) => {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+    try {
+        const formData = await request.formData();
+        const title = formData.get("title");
+        const status = formData.get('status');
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+        const extra_images_files = formData.getAll('extra_images');
+        const author = authenticationResponse.user.id;
+        const excerpt = formData.get('excerpt');
+        const content = formData.get('content');
+        const existing_image = formData.get("existing_image");
+
+        let featuredImageName = null;
+        const extraImageNames = [];
+
+        if (!title || !content || !author) {
+            return new Response(JSON.stringify({
+                error: "Missing required fields: title, content, or author."
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        if (image_data && image_data.size > 0) {
+            try {
+                const imageName = `${Date.now()}-${image_data.name}`;
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+                featuredImageName = imageName;
+            } catch (error) {
+                console.error("Featured image upload error:", error);
+                return new Response(JSON.stringify({
+                    error: "Featured image upload to R2 issue occurred within blog post.",
+                    details: error.message,
+                }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+            }
+        } else if (existing_image) {
+            featuredImageName = existing_image
+        }
+
+        // Handle extra images upload
+        for (const imageFile of extra_images_files) {
+            if (imageFile instanceof File && imageFile.size > 0) {
+                try {
+                    const imageName = `${Date.now()}-${imageFile.name}`;
+                    await env.KRISHI_BUCKET.put(imageName, imageFile.stream(), {
+                        httpMetadata: { contentType: imageFile.type, alt: alt_text || '' },
+                    });
+                    extraImageNames.push(imageName);
+                } catch (error) {
+                    console.error("Extra image upload error:", error);
+                    return new Response(JSON.stringify({
+                        error: "An error occurred during extra image upload to R2.",
+                        details: error.message,
+                    }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                }
+            }
+        }
+
+        const slug = createSlug(title);
+        const extraImagesList = extraImageNames.length > 0 ? extraImageNames.join(',') : null;
+
+        const query = `
+            INSERT INTO BlogPosts (title, slug, content, excerpt, status, featured_image_name, extra_images_list, author_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        await dbClient.execute(query, [
+            title,
+            slug,
+            content,
+            excerpt || null,
+            status || 'draft',
+            featuredImageName,
+            extraImagesList,
+            authenticationResponse.user.id,
+        ]);
+
+        return new Response(JSON.stringify({
+            message: "Blog post created successfully!",
+            slug,
+        }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        console.error("Failed to create blog post:", error);
+        return new Response(JSON.stringify({
+            error: "Failed to create blog post",
+            details: error.message
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+/**
+ * Update a blog post by ID with authorization, including extra images.
+ */
+const updateBlog = async (id, request, dbClient, env) => {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const title = formData.get("title");
+        const status = formData.get('status');
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+        const extra_images_files = formData.getAll('extra_images');
+        const excerpt = formData.get('excerpt');
+        const content = formData.get('content');
+        const existing_image = formData.get("existing_image");
+        const removedImageIndices = formData.getAll('removed_extra_image_indices').map(Number); //get removed indices
+
+        let featuredImageName = null;
+        let featuredImageChanged = false; // Flag to track if the featured image has been changed
+        const newExtraImageNames = [];
+
+        if (!title || !content) {
+            return new Response(JSON.stringify({
+                error: "Missing required fields: title or content."
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        // Handle featured image upload
+        if (image_data && image_data.size > 0) {
+            try {
+                const imageName = `${Date.now()}-${image_data.name}`;
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+                featuredImageName = imageName;
+                featuredImageChanged = true;
+            } catch (error) {
+                console.error("Featured image upload error:", error);
+                return new Response(JSON.stringify({
+                    error: "Featured image upload to R2 issue occurred within blog post.",
+                    details: error.message,
+                }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+            }
+        } else if (existing_image) {
+            featuredImageName = existing_image;
+            featuredImageChanged = true;
+        }
+
+        // Handle extra images upload
+        for (const imageFile of extra_images_files) {
+            if (imageFile instanceof File && imageFile.size > 0) {
+                try {
+                    const imageName = `${Date.now()}-${imageFile.name}`;
+                    await env.KRISHI_BUCKET.put(imageName, imageFile.stream(), {
+                        httpMetadata: { contentType: imageFile.type, alt: alt_text || '' },
+                    });
+                    newExtraImageNames.push(imageName);
+                } catch (error) {
+                    console.error("Extra image upload error:", error);
+                    return new Response(JSON.stringify({
+                        error: "An error occurred during extra image upload to R2.",
+                        details: error.message,
+                    }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                }
+            }
+        }
+
+        // Fetch the existing post data
+        const existingPostResult = await getBlogById(id, dbClient, env);
+
+        if (existingPostResult.status !== 200) {
+            return new Response(existingPostResult.body, {
+                status: existingPostResult.status,
+                headers: existingPostResult.headers,
+            });
+        }
+
+        const existingPost = JSON.parse(existingPostResult.body).post; // Parse the JSON body
+        let existingExtraImageNames = parseImageList(existingPost.extra_images_list);
+
+        // Remove extra images based on index (correctly handling index shifts)
+        if (removedImageIndices.length > 0) {
+            const imagesToDelete = [];
+            // Sort indices in descending order to prevent issues with index shifting during deletion
+            const sortedIndices = [...removedImageIndices].sort((a, b) => b - a);
+
+            for (const index of sortedIndices) {
+                if (index >= 0 && index < existingExtraImageNames.length) {
+                    const imageName = existingExtraImageNames.splice(index, 1)[0]; // Remove and get the imageName
+                    if (imageName) {
+                        imagesToDelete.push(imageName);
+                    }
+                }
+            }
+            // Delete the removed images from R2
+            await Promise.all(imagesToDelete.map(async (imageName) => {
+                try {
+                    await env.KRISHI_BUCKET.delete(imageName);
+                } catch (deleteError) {
+                    console.error(`Error deleting image ${imageName} from R2:`, deleteError);
+                }
+            }));
+        }
+
+        // Combine the existing and new extra image names
+        const combinedExtraImageNames = [...existingExtraImageNames, ...newExtraImageNames];
+        const extraImagesList = combinedExtraImageNames.length > 0 ? combinedExtraImageNames.join(',') : null;
+
+        // Check if any data has been changed to avoid unnecessary database updates
+        if (title === existingPost.title &&
+            content === existingPost.content &&
+            excerpt === existingPost.excerpt &&
+            status === existingPost.status &&
+            !featuredImageChanged && // Check if the featured image has been changed
+            extraImagesList === existingPost.extra_images_list
+        ) {
+            return new Response(JSON.stringify({
+                message: "No changes detected, blog post not updated.",
+            }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        const query = `
+            UPDATE BlogPosts
+            SET title = ?, content = ?, excerpt = ?, status = ?, featured_image_name = ?, extra_images_list = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE post_id = ? AND author_id = ?;
+        `;
+        const result = await dbClient.execute(query, [
+            title,
+            content,
+            excerpt || null,
+            status || 'draft',
+            featuredImageName,
+            extraImagesList,
+            id,
+            authenticationResponse.user.id,
+        ]);
+
+        if (result.rowsAffected === 0) {
+            return new Response(JSON.stringify({
+                error: "Blog post not found or unauthorized to update."
+            }), {
+                status: 404,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        return new Response(JSON.stringify({
+            message: "Blog post updated successfully!",
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        console.error("Failed to update blog post:", error);
+        return new Response(JSON.stringify({
+            error: "Failed to update blog post",
+            details: error.message
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+/**
+ * Delete a blog post by ID with authorization.
+ */
+const deleteBlog = async (id, request, dbClient, env) => {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+    try {
+
+        // Before deleting the blog post, fetch the image names to delete from R2
+        const postResult = await getBlogById(id, dbClient, env);
+
+        if (postResult.status !== 200) {
+            return new Response(postResult.body, {
+                status: postResult.status,
+                headers: postResult.headers,
+            });
+        }
+        const post = JSON.parse(postResult.body).post; // Parse the JSON body
+
+        if (post) {
+            const imageNamesToDelete = [];
+            if (post.featured_image_name) {
+                imageNamesToDelete.push(post.featured_image_name);
+            }
+            if (post.extra_images_list) {
+                imageNamesToDelete.push(...parseImageList(post.extra_images_list));
+            }
+
+            // Delete images from R2
+            await Promise.all(imageNamesToDelete.map(async (imageName) => {
+                if (imageName) {
+                    try {
+                        await env.KRISHI_BUCKET.delete(imageName);
+                    } catch (deleteError) {
+                        console.error(`Error deleting image ${imageName} from R2:`, deleteError);
+                        // Optionally, decide whether to throw an error and halt the process or continue
+                    }
+                }
+            }));
+        }
+
+        const query = `
+            DELETE FROM BlogPosts
+            WHERE post_id = ? AND author_id = ?;
+        `;
+        const result = await dbClient.execute(query, [
+            id,
+            authenticationResponse.user.id,
+        ]);
+
+        if (result.rowsAffected === 0) {
+            return new Response(JSON.stringify({
+                error: "Blog post not found or unauthorized to delete."
+            }), {
+                status: 404,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        return new Response(JSON.stringify({
+            message: "Blog post deleted successfully!",
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        console.error("Failed to delete blog post:", error);
+        return new Response(JSON.stringify({
+            error: "Failed to delete blog post",
+            details: error.message
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+module.exports = { getAllBlogs, getBlogById, createBlog, updateBlog, deleteBlog, getPublishedBlogs, getPublishedBlogById };
+import validateSession from "../utils/validateSession.controller";
+
+async function createDirector(request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const name = formData.get('name');
+        const position = formData.get('position');
+        const department = formData.get('department');
+        const hierarchical_id = formData.get('hierarchical_id');
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+
+        if (!name || !position || !hierarchical_id) {
+            return new Response(JSON.stringify({
+                error: "Missing required fields: name, position, or hierarchical_id.",
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+
+        let imageName = null;
+
+        if (image_data && image_data.size > 0) {
+            try {
+                imageName = `${Date.now()}-${image_data.name}`;
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                console.error("R2 upload error:", error);
+                return new Response(JSON.stringify({
+                    error: "Image upload to R2 failed.",
+                    details: error.message,
+                }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+            }
+        }
+
+        const query = `
+            INSERT INTO BoardOfDirectors (name, position, department, hierarchical_id, image_name, alt_text, active)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            RETURNING director_id;
+        `;
+
+        const result = await dbClient.execute(query, [name, position, department || null, hierarchical_id, imageName, alt_text || null]);
+        const director_id = result.rows[0].director_id;
+
+        return new Response(JSON.stringify({
+            message: "Director added successfully!",
+            director_id,
+        }), { status: 201, headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({
+            error: "Failed to add director.",
+            details: error.message,
+        }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+}
+
+async function editDirector(request, dbClient, director_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const name = formData.get('name');
+        const position = formData.get('position');
+        const department = formData.get('department');
+        const hierarchical_id = formData.get('hierarchical_id');
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+
+        let imageName = null;
+
+        // Check if a new image is being uploaded
+        if (image_data && image_data.size > 0) {
+            try {
+                // Generate unique name
+                imageName = `${Date.now()}-${image_data.name}`;
+
+                // Upload image
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                return new Response(JSON.stringify({
+                    error: "Image upload issue occurred within director.",
+                    details: error.message,
+                }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+            }
+        }
+
+
+        const query = `
+            UPDATE BoardOfDirectors
+            SET name = ?, position = ?, department = ?, hierarchical_id = ?, image_name = COALESCE(?, image_name), alt_text = COALESCE(?, alt_text)
+            WHERE director_id = ? AND active = 1
+        `;
+
+        await dbClient.execute(query, [name, position, department || null, hierarchical_id, imageName, alt_text, director_id]);
+
+        return new Response(JSON.stringify({
+            message: "Director updated successfully!",
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to edit director.",
+            details: error.message,
+        }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+}
+
+async function deleteDirector(request, dbClient, director_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        // Get the current director to access the image name for deletion
+        const getDirectorQuery = `SELECT image_name FROM BoardOfDirectors WHERE director_id = ?`;
+        const directorResult = await dbClient.execute(getDirectorQuery, [director_id]);
+
+        if (directorResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Director not found" }), { status: 404 });
+        }
+
+        const imageName = directorResult.rows[0].image_name;
+
+        // Delete the image from R2 if it exists
+        if (imageName) {
+            await env.KRISHI_BUCKET.delete(imageName);
+        }
+
+        const query = `
+            DELETE FROM BoardOfDirectors
+            WHERE director_id = ?
+        `;
+        await dbClient.execute(query, [director_id]);
+
+        return new Response(JSON.stringify({
+            message: "Director deleted successfully!",
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to delete director.",
+            details: error.message,
+        }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+}
+
+async function getAllDirectors(dbClient, env, isAuthenticated) {
+    try {
+        let query = `
+            SELECT director_id, name, position, department, hierarchical_id, image_name, alt_text, active
+            FROM BoardOfDirectors
+        `;
+        let params = [];
+        if (!isAuthenticated) {
+            query += ` WHERE active = 1`;
+        }
+        query += ` ORDER BY hierarchical_id ASC`;
+
+        const result = await dbClient.execute(query, params);
+
+        const directors = result.rows.map(row => ({
+            ...row,
+            image_url: row.image_name ? `${env.R2_PUBLIC_URL}/${row.image_name}` : null, // Construct the URL
+        }));
+
+        return new Response(JSON.stringify({
+            message: "Directors fetched successfully!",
+            directors: directors,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to fetch directors.",
+            details: error.message,
+        }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+}
+async function setDirectorActiveStatus(request, dbClient, director_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const { active } = await request.json();
+
+        if (typeof active !== 'boolean') {
+            return new Response(JSON.stringify({ error: "Invalid 'active' value. Must be a boolean." }), { status: 400 });
+        }
+
+        const query = `
+            UPDATE BoardOfDirectors
+            SET active = ?
+            WHERE director_id = ?
+        `;
+        await dbClient.execute(query, [active ? 1 : 0, director_id]);
+
+        return new Response(JSON.stringify({ message: `Director ${active ? 'activated' : 'deactivated'} successfully` }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to update director active status", details: error.message }), { status: 500 });
+    }
+}
+module.exports = { createDirector, editDirector, deleteDirector, getAllDirectors, setDirectorActiveStatus };
+import validateSession from "../utils/validateSession.controller";
+
+async function activateContact(id, request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+    try {
+        // Deactivate all other contacts
+        const deactivateQuery = `UPDATE contacts SET status = 'inactive' WHERE status = 'active'`;
+        await dbClient.execute(deactivateQuery);
+
+        // Activate the selected contact
+        const activateQuery = `UPDATE contacts SET status = 'active' WHERE id = ?`;
+        await dbClient.execute(activateQuery, [id]);
+
+        return new Response(JSON.stringify({ message: "Contact activated successfully!" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+
+    } catch (error) {
+        return new Response(JSON.stringify({ error: "Failed to activate contact", details: error.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+}
+async function createContact(request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (authenticationResponse.status) {
+        try {
+            const { name, company_name, address, location, phone, mobile, additional_numbers, email, additional_emails } = await request.json();
+
+            if (!name || !email) {
+                return new Response(JSON.stringify({ error: "Missing required fields: name or email." }), {
+                    status: 400,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+
+            const insertQuery = `
+                INSERT INTO contacts (name, company_name, address, location, phone, mobile, additional_numbers, email, additional_emails, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'inactive')
+            `;
+
+
+            await dbClient.execute(insertQuery, [
+                name,
+                company_name,
+                address,
+                location,
+                phone,
+                mobile,
+                JSON.stringify(additional_numbers || []),
+                email,
+                JSON.stringify(additional_emails || []),
+            ]);
+
+            return new Response(JSON.stringify({ message: "Contact created successfully!" }), {
+                status: 201,
+                headers: { "Content-Type": "application/json" },
+            });
+        } catch (error) {
+            return new Response(JSON.stringify({ error: "Failed to create contact", details: error.message }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+    }
+    return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+}
+
+async function editContact(id, request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (authenticationResponse.status) {
+        try {
+            const { name, company_name, address, location, phone, mobile, additional_numbers, email, additional_emails } = await request.json();
+
+            const updateQuery = `
+                UPDATE contacts
+                SET name = ?, company_name = ?, address = ?, location = ?, phone = ?, mobile = ?,
+                    additional_numbers = ?, email = ?, additional_emails = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            `;
+
+            await dbClient.execute(updateQuery, [
+                name,
+                company_name,
+                address,
+                location,
+                phone,
+                mobile,
+                JSON.stringify(additional_numbers || []),
+                email,
+                JSON.stringify(additional_emails || []),
+                id,
+            ]);
+
+            return new Response(JSON.stringify({ message: "Contact updated successfully!" }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        } catch (error) {
+            return new Response(JSON.stringify({ error: "Failed to update contact", details: error.message }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+    }
+    return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+}
+
+async function getAllContacts(dbClient, env, isAuthenticated) {
+    try {
+        let query = `SELECT * FROM contacts`;
+
+        if (!isAuthenticated) {
+            query += ` WHERE status = 'active'`;
+        }
+
+        const { rows } = await dbClient.execute(query);
+
+        return new Response(JSON.stringify({ message: "Contacts fetched successfully!", contacts: rows }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+
+    } catch (err) {
+        return new Response(JSON.stringify({ error: "Failed to fetch contact", details: err.message }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        })
+    }
+
+}
+async function deleteContact(id, request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (authenticationResponse.status) {
+        try {
+            const deleteQuery = `
+                DELETE FROM contacts
+                WHERE id = ?
+            `;
+            await dbClient.execute(deleteQuery, [id]);
+
+            return new Response(JSON.stringify({ message: "Contact deleted successfully!" }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        } catch (error) {
+            return new Response(JSON.stringify({ error: "Failed to delete contact", details: error.message }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+    }
+    return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+}
+
+
+
+module.exports = { activateContact, createContact, editContact, deleteContact, getAllContacts };
+import validateSession from "../utils/validateSession.controller";
+
+// Helper function to validate YouTube URLs
+function isValidYouTubeUrl(url) {
+    const youtubeRegex = /^(https?:\/\/)?(www\.)?(youtube\.com|youtu\.be)\/.+$/;
+    return youtubeRegex.test(url);
+}
+
+// Helper function to validate image files
+function isValidImageFile(file) {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    const maxSize = 10 * 1024 * 1024; // 10MB
+    
+    return allowedTypes.includes(file.type) && file.size <= maxSize;
+}
+
+// Helper function to normalize media type
+function normalizeMediaType(type) {
+    if (!type) return null;
+    return type.toLowerCase().trim();
+}
+
+async function createMedia(request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const type = normalizeMediaType(formData.get('type')); // Normalize the type
+        const title = formData.get('title');
+        const description = formData.get('description');
+        const file_data = formData.getAll('file_data');
+        const urls = formData.getAll('urls');
+        const visible = formData.get('visible') === 'true';
+
+        if (!type || !title) {
+            return new Response(JSON.stringify({ error: "Missing required fields: type and title" }), { status: 400 });
+        }
+
+        if (type !== 'image' && type !== 'youtube') {
+            return new Response(JSON.stringify({ error: "Invalid media type. Must be 'image' or 'youtube'" }), { status: 400 });
+        }
+
+        let mediaUrls = [];
+
+        if (type === 'image') {
+            // For image type, we need at least one file
+            if (file_data.length === 0) {
+                return new Response(JSON.stringify({ error: "At least one image file is required for type 'image'" }), { status: 400 });
+            }
+
+            // Validate all files before uploading
+            for (const file of file_data) {
+                if (file && file.size > 0 && !isValidImageFile(file)) {
+                    return new Response(JSON.stringify({ 
+                        error: "Invalid file type or size. Only images (JPEG, PNG, GIF, WebP) up to 10MB are allowed." 
+                    }), { status: 400 });
+                }
+            }
+
+            // Handle file uploads for photos
+            for (const file of file_data) {
+                if (file && file.size > 0) {
+                    try {
+                        const fileName = `${Date.now()}-${file.name}`;
+                        await env.KRISHI_BUCKET.put(fileName, file.stream(), {
+                            httpMetadata: { contentType: file.type },
+                        });
+                        mediaUrls.push(`${env.R2_PUBLIC_URL}/${fileName}`);
+                    } catch (error) {
+                        console.error("R2 upload error:", error);
+                        return new Response(JSON.stringify({ error: "File upload to R2 failed" }), { status: 500 });
+                    }
+                }
+            }
+        } else if (type === 'youtube') {
+            // For youtube type, we need exactly one URL
+            if (urls.length !== 1) {
+                return new Response(JSON.stringify({ error: "Exactly one YouTube URL is required for type 'youtube'" }), { status: 400 });
+            }
+            mediaUrls = urls;
+        }
+
+        const query = `
+            INSERT INTO media (type, urls, title, description, visible)
+            VALUES (?, ?, ?, ?, ?)
+            RETURNING id;
+        `;
+
+        const result = await dbClient.execute(query, [
+            type,
+            JSON.stringify(mediaUrls),
+            title,
+            description || null,
+            visible
+        ]);
+        const mediaId = result.rows[0].id;
+
+        return new Response(JSON.stringify({ message: "Media created successfully", mediaId }), { status: 201 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to create media", details: error.message }), { status: 500 });
+    }
+}
+
+async function getMedia(request, dbClient, env) {
+    try {
+        const authenticationResponse = await validateSession(request, env);
+        const isAuthenticated = authenticationResponse.status;
+
+        let query = `
+            SELECT id, type, urls, title, description, created_at, visible
+            FROM media
+        `;
+
+        if (!isAuthenticated) {
+            query += ` WHERE visible = 1`;
+        }
+
+        query += ` ORDER BY created_at DESC`;
+
+        const result = await dbClient.execute(query);
+        const media = result.rows.map(row => {
+            try {
+                return {
+                    ...row,
+                    urls: JSON.parse(row.urls || '[]')
+                };
+            } catch (parseError) {
+                console.error("Error parsing URLs:", parseError);
+                return {
+                    ...row,
+                    urls: []
+                };
+            }
+        });
+
+        return new Response(JSON.stringify({ message: "Media fetched successfully", media }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to fetch media", details: error.message }), { status: 500 });
+    }
+}
+
+async function editMedia(request, dbClient, mediaId, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const type = normalizeMediaType(formData.get('type')); // Normalize the type
+        const title = formData.get('title');
+        const description = formData.get('description');
+        const file_data = formData.getAll('file_data');
+        const urls = formData.getAll('urls');
+        const visible = formData.get('visible') === 'true';
+        const removeUrls = formData.getAll('remove_urls');
+        const removeFiles = formData.getAll('remove_files');
+
+        if (type !== 'image' && type !== 'youtube') {
+            return new Response(JSON.stringify({ error: "Invalid media type. Must be 'image' or 'youtube'" }), { status: 400 });
+        }
+
+        // Get existing media data
+        const existingMediaQuery = `SELECT type, urls FROM media WHERE id = ?`;
+        const existingMediaResult = await dbClient.execute(existingMediaQuery, [mediaId]);
+
+        if (!existingMediaResult.rows || existingMediaResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Media not found" }), { status: 404 });
+        }
+
+        const existingType = existingMediaResult.rows[0].type;
+        let existingUrls;
+        try {
+            existingUrls = JSON.parse(existingMediaResult.rows[0].urls || '[]');
+        } catch (parseError) {
+            console.error("Error parsing existing URLs:", parseError);
+            existingUrls = [];
+        }
+
+        let newUrls = [];
+
+        if (type === 'image') {
+            // For image type, validate new files
+            for (const file of file_data) {
+                if (file && file.size > 0 && !isValidImageFile(file)) {
+                    return new Response(JSON.stringify({ 
+                        error: "Invalid file type or size. Only images (JPEG, PNG, GIF, WebP) up to 10MB are allowed." 
+                    }), { status: 400 });
+                }
+            }
+
+            // Handle file deletions
+            for (const url of removeFiles) {
+                try {
+                    const fileName = url.split('/').pop();
+                    await env.KRISHI_BUCKET.delete(fileName);
+                    existingUrls = existingUrls.filter(u => u !== url);
+                } catch (error) {
+                    console.error("R2 delete error:", error);
+                    return new Response(JSON.stringify({ error: "File delete from R2 failed" }), { status: 500 });
+                }
+            }
+
+            // Handle new file uploads
+            for (const file of file_data) {
+                if (file && file.size > 0) {
+                    try {
+                        const fileName = `${Date.now()}-${file.name}`;
+                        await env.KRISHI_BUCKET.put(fileName, file.stream(), {
+                            httpMetadata: { contentType: file.type },
+                        });
+                        newUrls.push(`${env.R2_PUBLIC_URL}/${fileName}`);
+                    } catch (error) {
+                        console.error("R2 upload error:", error);
+                        return new Response(JSON.stringify({ error: "File upload to R2 failed" }), { status: 500 });
+                    }
+                }
+            }
+        } else if (type === 'youtube') {
+            // For youtube type, we need exactly one URL
+            if (urls.length !== 1) {
+                return new Response(JSON.stringify({ error: "Exactly one YouTube URL is required for type 'youtube'" }), { status: 400 });
+            }
+            newUrls = urls;
+        }
+
+        // Combine existing and new URLs
+        const allUrls = type === 'youtube' ? newUrls : [...existingUrls, ...newUrls];
+
+        const query = `
+            UPDATE media
+            SET type = ?, urls = ?, title = ?, description = ?, visible = ?
+            WHERE id = ?;
+        `;
+
+        await dbClient.execute(query, [
+            type,
+            JSON.stringify(allUrls),
+            title,
+            description || null,
+            visible,
+            mediaId
+        ]);
+
+        return new Response(JSON.stringify({ 
+            message: "Media updated successfully",
+            media: {
+                id: mediaId,
+                type,
+                urls: allUrls,
+                title,
+                description,
+                visible
+            }
+        }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to edit media", details: error.message }), { status: 500 });
+    }
+}
+
+async function deleteMedia(request, dbClient, mediaId, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        // Get media data before deletion
+        const getMediaQuery = `SELECT type, urls FROM media WHERE id = ?`;
+        const mediaResult = await dbClient.execute(getMediaQuery, [mediaId]);
+
+        if (mediaResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Media not found" }), { status: 404 });
+        }
+
+        let urls;
+        try {
+            urls = JSON.parse(mediaResult.rows[0].urls || '[]');
+        } catch (parseError) {
+            console.error("Error parsing URLs:", parseError);
+            urls = [];
+        }
+
+        // Delete all files from R2 if it's an image type
+        if (mediaResult.rows[0].type === 'image') {
+            const deletePromises = urls.map(async (url) => {
+                if (url.startsWith(env.R2_PUBLIC_URL)) {
+                    const fileName = url.split('/').pop();
+                    try {
+                        await env.KRISHI_BUCKET.delete(fileName);
+                    } catch (error) {
+                        console.error(`Error deleting file ${fileName}:`, error);
+                    }
+                }
+            });
+            await Promise.all(deletePromises);
+        }
+
+        const query = `DELETE FROM media WHERE id = ?`;
+        await dbClient.execute(query, [mediaId]);
+
+        return new Response(JSON.stringify({ message: "Media deleted successfully" }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to delete media", details: error.message }), { status: 500 });
+    }
+}
+
+module.exports = { createMedia, getMedia, editMedia, deleteMedia }; 
+import validateSession from "../utils/validateSession.controller"; 
+
+const getAllMessages = async (request, dbClient, env) => {
+    const authenticationResponse = await validateSession(request, env);
+    if (authenticationResponse.status) {
+        try {
+            const query = `SELECT * FROM messages ORDER BY created_at DESC`;
+            const result = await dbClient.execute(query);
+            return new Response(JSON.stringify({
+                message: "Messages fetched successfully!", 
+                data: result.rows,
+            }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+        } catch (error) {
+            return new Response(JSON.stringify({
+                error: "Failed to retrieve messages",
+                details: error.message,
+            }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+    } else {
+        return new Response(JSON.stringify({
+            error: "Unauthorized to retrieve messages." 
+        }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+const getMessageById = async (request, id, dbClient, env) => { // Added request and env parameters
+    const authenticationResponse = await validateSession(request, env);
+    if (authenticationResponse.status) {
+        try {
+            const query = `SELECT * FROM messages WHERE id = ?`;
+            const result = await dbClient.execute(query, [id]);
+            if (result.rows.length === 0) { 
+                return new Response(JSON.stringify({
+                    error: "Message not found",
+                }), {
+                    status: 404,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+
+            return new Response(JSON.stringify({
+                message: "Message fetched successfully!", 
+                data: result.rows[0]
+            }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        } catch (error) {
+            return new Response(JSON.stringify({
+                error: "Failed to retrieve message",
+                details: error.message,
+            }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+    } else {
+        return new Response(JSON.stringify({
+            error: "Unauthorized to retrieve message." 
+        }), {
+            status: 401,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+const createMessage = async (request, dbClient) => {
+    try {
+        const { name, message, email, contact_number } = await request.json();
+
+        // Validate required fields
+        if (!name || !message || !email) {
+            return new Response(JSON.stringify({
+                error: "Missing required fields: name, message, or email."
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        // Insert message into the database
+        const query = `
+            INSERT INTO messages (name, message, email, contact_number)
+            VALUES (?, ?, ?, ?)
+        `;
+        await dbClient.execute(query, [
+            name,
+            message,
+            email,
+            contact_number || null,
+        ]);
+
+        return new Response(JSON.stringify({
+            message: "Message created successfully!"
+        }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to create message",
+            details: error.message,
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+module.exports = {
+    getAllMessages,
+    getMessageById,
+    createMessage,
+};
+import validateSession from "../utils/validateSession.controller";
+
+async function createPopupMessage(request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const title = formData.get('title');
+        const content = formData.get('content');
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+        const start_date = formData.get('start_date');
+        const end_date = formData.get('end_date');
+
+        if (!title || !content) {
+            return new Response(JSON.stringify({ error: "Missing required fields: title and content" }), { status: 400 });
+        }
+
+        let imageName = null;
+
+        if (image_data && image_data.size > 0) {
+            try {
+                imageName = `${Date.now()}-${image_data.name}`;
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                console.error("R2 upload error:", error);
+                return new Response(JSON.stringify({ error: "Image upload to R2 failed" }), { status: 500 });
+            }
+        }
+
+        const query = `
+            INSERT INTO PopupMessages (title, content, image_name, alt_text, start_date, end_date, active)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            RETURNING popup_id;
+        `;
+
+        const result = await dbClient.execute(query, [title, content, imageName, alt_text || null, start_date || null, end_date || null]);
+        const popup_id = result.rows[0].popup_id;
+
+        return new Response(JSON.stringify({ message: "Popup message created successfully", popup_id }), { status: 201 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to create popup message", details: error.message }), { status: 500 });
+    }
+}
+
+async function editPopupMessage(request, dbClient, popup_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const title = formData.get('title');
+        const content = formData.get('content');
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+        const start_date = formData.get('start_date');
+        const end_date = formData.get('end_date');
+        const deleteImage = formData.get('deleteImage') === 'true';
+
+        // Get existing data for the blog post
+        const existingPopupQuery = `SELECT image_name FROM PopupMessages WHERE popup_id = ?`;
+        const existingPopupResult = await dbClient.execute(existingPopupQuery, [popup_id]);
+
+        if (!existingPopupResult.rows || existingPopupResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Popup message not found" }), { status: 404 });
+        }
+        let imageName = existingPopupResult.rows[0].image_name;
+
+
+        if (deleteImage && imageName) {
+            try {
+                await env.KRISHI_BUCKET.delete(imageName);
+                imageName = null;
+            } catch (error) {
+                console.error("R2 delete error:", error);
+                return new Response(JSON.stringify({ error: "Image delete from R2 failed" }), { status: 500 });
+            }
+        }
+
+        if (image_data && image_data.size > 0) {
+            try {
+                imageName = `${Date.now()}-${image_data.name}`;
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                console.error("R2 upload error:", error);
+                return new Response(JSON.stringify({ error: "Image upload to R2 failed" }), { status: 500 });
+            }
+        }
+
+
+        const query = `
+            UPDATE PopupMessages
+            SET title = ?, content = ?, image_name = ?, alt_text = ?, start_date = ?, end_date = ?
+            WHERE popup_id = ?;
+        `;
+
+        await dbClient.execute(query, [title, content, imageName, alt_text || null, start_date || null, end_date || null, popup_id]);
+
+        return new Response(JSON.stringify({ message: "Popup message updated successfully" }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to edit popup message", details: error.message }), { status: 500 });
+    }
+}
+
+async function deletePopupMessage(request, dbClient, popup_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        // Get the image name for deletion
+        const getPopupQuery = `SELECT image_name FROM PopupMessages WHERE popup_id = ?`;
+        const popupResult = await dbClient.execute(getPopupQuery, [popup_id]);
+
+        if (popupResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Popup message not found" }), { status: 404 });
+        }
+
+        const imageName = popupResult.rows[0].image_name;
+
+        // Delete the image from R2 if it exists
+        if (imageName) {
+            await env.KRISHI_BUCKET.delete(imageName);
+        }
+        const query = `DELETE FROM PopupMessages WHERE popup_id = ?`;
+        await dbClient.execute(query, [popup_id]);
+
+        return new Response(JSON.stringify({ message: "Popup message deleted successfully" }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to delete popup message", details: error.message }), { status: 500 });
+    }
+}
+
+async function getPopupMessages(request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    const isAuthenticated = authenticationResponse.status;
+
+    try {
+        let query = `
+            SELECT popup_id, title, content, image_name, alt_text, start_date, end_date, active
+            FROM PopupMessages
+        `;
+
+        if (!isAuthenticated) {
+            query += `
+            WHERE active = 1 AND
+                  (start_date IS NULL OR start_date <= CURRENT_TIMESTAMP) AND
+                  (end_date IS NULL OR end_date >= CURRENT_TIMESTAMP)
+        `;
+        }
+
+        query += ` ORDER BY created_at DESC;`;
+        const result = await dbClient.execute(query);
+
+        const popupMessages = result.rows.map(row => ({
+            ...row,
+            image_url: row.image_name ? `${env.R2_PUBLIC_URL}/${row.image_name}` : null, // Construct the URL
+        }));
+
+        return new Response(JSON.stringify({ message: "Popup messages fetched successfully", popupMessages }), { status: 200 });
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to fetch popup messages", details: error.message }), { status: 500 });
+    }
+}
+
+async function setPopupActiveStatus(request, dbClient, popup_id) {
+
+    try {
+        const { active } = await request.json();
+
+        if (typeof active !== 'boolean') {
+            return new Response(JSON.stringify({ error: "Invalid 'active' value. Must be a boolean." }), { status: 400 });
+        }
+
+        const query = `
+            UPDATE PopupMessages
+            SET active = ?
+            WHERE popup_id = ?
+        `;
+        await dbClient.execute(query, [active ? 1 : 0, popup_id]);
+
+        return new Response(JSON.stringify({ message: `Popup message ${active ? 'activated' : 'deactivated'} successfully` }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to update popup message status", details: error.message }), { status: 500 });
+    }
+}
+
+module.exports = { createPopupMessage, getPopupMessages, editPopupMessage, deletePopupMessage, setPopupActiveStatus };
+import validateSession from "../utils/validateSession.controller";
+
+const createProduct = async (request, dbClient, env) => {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+    try {
+        const formData = await request.formData();
+        const name = formData.get('name');
+        const description = formData.get('description');
+        const price = parseFloat(formData.get('price'));
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+        const rating = parseFloat(formData.get('rating')) || 0;
+        const review_count = parseInt(formData.get('review_count')) || 0;
+        const available = formData.get('available') === 'true';
+
+        if (!name || isNaN(price)) {
+            return new Response(JSON.stringify({
+                error: "Missing required fields: name or price.",
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+        let imageName = null;
+
+        if (image_data && image_data.size > 0) {
+            try {
+                imageName = `${Date.now()}-${image_data.name}`;
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                console.error("R2 upload error:", error);
+                return new Response(JSON.stringify({ error: "Image upload to R2 failed" }), { status: 500 });
+            }
+        }
+
+
+        const query = `
+            INSERT INTO products (name, description, price, image_name, alt_text, rating, review_count, available)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+        await dbClient.execute(query, [
+            name,
+            description || null,
+            price,
+            imageName || null,
+            alt_text || null,
+            rating,
+            review_count,
+            available,
+        ]);
+
+        return new Response(JSON.stringify({
+            message: "Product created successfully!",
+        }), {
+            status: 201,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to create product",
+            details: error.message,
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+const getAllProducts = async (dbClient, env, isAuthenticated) => {
+    try {
+        let query = 'SELECT * FROM products';
+        let whereClause = '';
+        let params = [];
+
+        if (!isAuthenticated) {
+            whereClause = ' WHERE available = true';
+        }
+
+        query += whereClause + ' ORDER BY created_at DESC';
+
+        const result = await dbClient.execute(query, params);
+        const products = result.rows.map(row => ({
+            ...row,
+            image_url: row.image_name ? `${env.R2_PUBLIC_URL}/${row.image_name}` : null,
+        }));
+
+        return new Response(JSON.stringify({
+            message: "Products fetched successfully!",
+            productCount: products.length,
+            products: products,
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to fetch products",
+            details: error.message,
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+const editProduct = async (request, dbClient, env, product_id) => {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+    try {
+        const formData = await request.formData();
+        const name = formData.get('name');
+        const description = formData.get('description');
+        const price = parseFloat(formData.get('price'));
+        const image_data = formData.get('image_data');
+        const alt_text = formData.get('alt_text');
+        const rating = parseFloat(formData.get('rating')) || 0;
+        const review_count = parseInt(formData.get('review_count')) || 0;
+        const available = formData.get('available') === 'true';
+        const deleteImage = formData.get('delete_image') === 'true'; // New field
+
+        if (!name || isNaN(price)) {
+            return new Response(JSON.stringify({
+                error: "Missing required fields: name or price.",
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+
+        let imageName = null;
+
+        if (image_data && image_data.size > 0) {
+            try {
+                imageName = `${Date.now()}-${image_data.name}`;
+                await env.KRISHI_BUCKET.put(imageName, image_data.stream(), {
+                    httpMetadata: { contentType: image_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                console.error("R2 upload error:", error);
+                return new Response(JSON.stringify({ error: "Image upload to R2 failed" }), { status: 500 });
+            }
+        } else if (deleteImage) {
+            imageName = null;  // Explicitly set image_name to NULL if the user wants to delete the image
+        }
+
+        const query = `
+            UPDATE products
+            SET name = ?, description = ?, price = ?, image_name = COALESCE(?, image_name), alt_text = COALESCE(?, alt_text), rating = ?, review_count = ?, available = ?
+            WHERE product_id = ?
+        `;
+        await dbClient.execute(query, [
+            name,
+            description || null,
+            price,
+            imageName,
+            alt_text || null,
+            rating,
+            review_count,
+            available,
+            product_id,
+        ]);
+
+        return new Response(JSON.stringify({
+            message: "Product updated successfully!",
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to update product",
+            details: error.message,
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+const deleteProduct = async (dbClient, request, env, product_id) => {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+    try {
+        // Get the current product to access the image name for deletion
+        const getProductQuery = `SELECT image_name FROM products WHERE product_id = ?`;
+        const productResult = await dbClient.execute(getProductQuery, [product_id]);
+
+        if (productResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Product not found" }), { status: 404 });
+        }
+
+        const imageName = productResult.rows[0].image_name;
+
+        // Delete the image from R2 if it exists
+        if (imageName) {
+            await env.KRISHI_BUCKET.delete(imageName);
+        }
+
+        const query = `
+            UPDATE products
+            SET available = false
+            WHERE product_id = ?
+        `;
+        await dbClient.execute(query, [product_id]);
+
+        return new Response(JSON.stringify({
+            message: "Product deactivated successfully!",
+        }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (error) {
+        return new Response(JSON.stringify({
+            error: "Failed to deactivate product",
+            details: error.message,
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+};
+
+module.exports = { createProduct, getAllProducts, editProduct, deleteProduct };
+import validateSession from "../utils/validateSession.controller";
+
+async function createPublication(request, dbClient, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const title = formData.get('title');
+        const description = formData.get('description');
+        const type = formData.get('type');
+        const file_data = formData.get('file_data');
+        const published_date = formData.get('published_date');
+        const alt_text = formData.get('alt_text');
+
+        if (!title || !type || !file_data) {
+            return new Response(JSON.stringify({ error: "Missing required fields: title, type, and file." }), { status: 400 });
+        }
+
+        let fileName = null;
+
+        if (file_data && file_data.size > 0) {
+            try {
+                fileName = `${Date.now()}-${file_data.name}`;
+                await env.KRISHI_BUCKET.put(fileName, file_data.stream(), {
+                    httpMetadata: { contentType: file_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                console.error("R2 upload error:", error);
+                return new Response(JSON.stringify({ error: "File upload to R2 failed" }), { status: 500 });
+            }
+        }
+
+        const query = `
+            INSERT INTO Publications (title, description, type, file_name, published_date, alt_text, active)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            RETURNING publication_id;
+        `;
+
+        const result = await dbClient.execute(query, [title, description || null, type, fileName, published_date || null, alt_text || null]);
+        const publication_id = result.rows[0].publication_id;
+
+        return new Response(JSON.stringify({ message: "Publication created successfully", publication_id }), { status: 201 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to create publication", details: error.message }), { status: 500 });
+    }
+}
+
+async function editPublication(request, dbClient, publication_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const formData = await request.formData();
+        const title = formData.get('title');
+        const description = formData.get('description');
+        const type = formData.get('type');
+        const file_data = formData.get('file_data');
+        const published_date = formData.get('published_date');
+        const alt_text = formData.get('alt_text');
+        const deleteFile = formData.get('deleteFile') === 'true';
+
+        // Get existing data for the publication
+        const existingPublicationQuery = `SELECT file_name FROM Publications WHERE publication_id = ?`;
+        const existingPublicationResult = await dbClient.execute(existingPublicationQuery, [publication_id]);
+
+        if (!existingPublicationResult.rows || existingPublicationResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Publication not found" }), { status: 404 });
+        }
+
+        let fileName = existingPublicationResult.rows[0].file_name;
+
+        // Handle file deletion
+        if (deleteFile && fileName) {
+            try {
+                await env.KRISHI_BUCKET.delete(fileName);
+                fileName = null;
+            } catch (error) {
+                console.error("R2 delete error:", error);
+                return new Response(JSON.stringify({ error: "File delete from R2 failed" }), { status: 500 });
+            }
+        }
+        if (file_data && file_data.size > 0) {
+            try {
+                fileName = `${Date.now()}-${file_data.name}`;
+                await env.KRISHI_BUCKET.put(fileName, file_data.stream(), {
+                    httpMetadata: { contentType: file_data.type, alt: alt_text || '' },
+                });
+            } catch (error) {
+                console.error("R2 upload error:", error);
+                return new Response(JSON.stringify({ error: "File upload to R2 failed" }), { status: 500 });
+            }
+        }
+
+        const query = `
+            UPDATE Publications
+            SET title = ?, description = ?, type = ?, file_name = ?, published_date = ?, alt_text = ?
+            WHERE publication_id = ?;
+        `;
+
+        await dbClient.execute(query, [title, description || null, type, fileName, published_date || null, alt_text || null, publication_id]);
+
+        return new Response(JSON.stringify({ message: "Publication updated successfully" }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to edit publication", details: error.message }), { status: 500 });
+    }
+}
+
+async function deletePublication(request, dbClient, publication_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const getPublicationQuery = `SELECT file_name FROM Publications WHERE publication_id = ?`;
+        const publicationResult = await dbClient.execute(getPublicationQuery, [publication_id]);
+
+        if (publicationResult.rows.length === 0) {
+            return new Response(JSON.stringify({ error: "Publication not found" }), { status: 404 });
+        }
+
+        const fileName = publicationResult.rows[0].file_name;
+
+        if (fileName) {
+            await env.KRISHI_BUCKET.delete(fileName);
+        }
+
+        const query = `DELETE FROM Publications WHERE publication_id = ?`;
+        await dbClient.execute(query, [publication_id]);
+
+        return new Response(JSON.stringify({ message: "Publication deleted successfully" }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to delete publication", details: error.message }), { status: 500 });
+    }
+}
+
+async function getPublications(request, dbClient, env) {
+    try {
+        const authenticationResponse = await validateSession(request, env);
+        const isAuthenticated = authenticationResponse.status;
+
+        let query = `
+            SELECT publication_id, title, description, type, file_name, alt_text, published_date, active
+            FROM Publications
+        `;
+
+        if (!isAuthenticated) {
+            query += ` WHERE active = 1`;
+        }
+
+        query += ` ORDER BY published_date DESC`;
+
+        const result = await dbClient.execute(query);
+
+        const publications = result.rows.map(row => ({
+            ...row,
+            file_url: `${env.R2_PUBLIC_URL}/${row.file_name}`,
+        }));
+
+        // Group the publications by type
+        const groupedPublications = publications.reduce((acc, publication) => {
+            if (!acc[publication.type]) {
+                acc[publication.type] = [];
+            }
+            acc[publication.type].push(publication);
+            return acc;
+        }, {});
+
+        return new Response(JSON.stringify({ message: "Publications fetched successfully", publications: groupedPublications }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to fetch publications", details: error.message }), { status: 500 });
+    }
+}
+
+async function setPublicationActiveStatus(request, dbClient, publication_id, env) {
+    const authenticationResponse = await validateSession(request, env);
+    if (!authenticationResponse.status) {
+        return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+    }
+
+    try {
+        const { active } = await request.json();
+
+        if (typeof active !== 'boolean') {
+            return new Response(JSON.stringify({ error: "Invalid 'active' value. Must be a boolean." }), { status: 400 });
+        }
+
+        let query;
+        let params = [active ? 1 : 0, publication_id];
+
+        // If activating AND published_date is NULL, set published_date to now
+        if (active) {
+            query = `
+                UPDATE Publications
+                SET active = ?, published_date = CASE WHEN published_date IS NULL THEN CURRENT_TIMESTAMP ELSE published_date END
+                WHERE publication_id = ?
+            `;
+        } else {
+            query = `
+                UPDATE Publications
+                SET active = ?
+                WHERE publication_id = ?
+            `;
+        }
+
+        await dbClient.execute(query, params);
+
+        return new Response(JSON.stringify({ message: `Publication ${active ? 'activated' : 'deactivated'} successfully` }), { status: 200 });
+
+    } catch (error) {
+        console.error("Database error:", error);
+        return new Response(JSON.stringify({ error: "Failed to update publication status", details: error.message }), { status: 500 });
+    }
+}
+
+module.exports = { createPublication, getPublications, editPublication, deletePublication, setPublicationActiveStatus };
+////////////////////////////////
+//                            //
+//  Link Files and Functions  //
+//                            //
+////////////////////////////////
+import validateSession from "../utils/validateSession.controller";
+
+
+const { login, signup } = require('../controller/auth.controller');
+const { getAllBlogs, getBlogById, createBlog, updateBlog, deleteBlog, getPublishedBlogs, getPublishedBlogById } = require('../controller/blog.controller');
+const { createDirector, editDirector, deleteDirector, getAllDirectors, setDirectorActiveStatus } = require('../controller/board.controller');
+const { activateContact, createContact, editContact, viewContact, deleteContact, getActiveContact, getAllContacts } = require('../controller/contact.controller');
+const { createPopupMessage, getPopupMessages, editPopupMessage, deletePopupMessage, setPopupActiveStatus } = require('../controller/popup.controller');
+const { createProduct, getAllProducts, editProduct, deleteProduct } = require('../controller/product.controller')
+const { getAllMessages, getMessageById, createMessage } = require('../controller/message.controller');
+const { createPublication, getPublications, editPublication, deletePublication, setPublicationActiveStatus } = require("../controller/publications.controller")
+const { createMedia, getMedia, editMedia, deleteMedia } = require('../controller/media.controller');
+
+////////////////////////////////
+//                            //
+//   Don't Touch This Class   //
+//                            //
+////////////////////////////////
+
+class Router {
+    constructor() {
+        this.routes = {};
+    }
+
+    addRoute(path, methods) {
+        this.routes[path] = methods;
+    }
+
+    async handleRequest(request, env, dbClient) {
+        const url = new URL(request.url);
+        const path = url.pathname; // Get the pathname
+        const type = request.method;
+
+        // Check for exact match first, before parameter matching:
+        const exactRoute = this.routes[path];
+        if (exactRoute) {
+            const handler = exactRoute[type];
+            if (!handler) {
+                return new Response(JSON.stringify({ error: "Method not allowed" }), {
+                    status: 405,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+            try {
+                return await handler(request, dbClient, env);
+            } catch (error) {
+                return new Response(JSON.stringify({
+                    error: "Server error",
+                    details: error.message
+                }), {
+                    status: 500,
+                    headers: { "Content-Type": "application/json" },
+                });
+            }
+        }
+
+        // Handle parameter matching routes
+        for (const routePath in this.routes) {
+            const routeRegex = new RegExp('^' + routePath.replace(/:\w+/g, '([^/]+)') + '$');
+            const match = path.match(routeRegex);
+
+            if (match) {
+                const params = {};
+                const paramNames = (routePath.match(/:(\w+)/g) || []).map(p => p.slice(1));
+                for (let i = 1; i < match.length; i++) {
+                    params[paramNames[i - 1]] = match[i]
+                }
+                request.params = params;
+
+                const handler = this.routes[routePath][type];
+                if (!handler) {
+                    return new Response(JSON.stringify({ error: "Method not allowed" }), {
+                        status: 405,
+                        headers: { "Content-Type": "application/json" },
+                    });
+                }
+                try {
+                    return await handler(request, dbClient, env);
+                } catch (error) {
+                    return new Response(JSON.stringify({
+                        error: "Server error",
+                        details: error.message
+                    }), {
+                        status: 500,
+                        headers: { "Content-Type": "application/json" },
+                    });
+                }
+            }
+
+        }
+
+
+        return new Response(JSON.stringify({ error: "Route not found" }), {
+            status: 404,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+}
+
+const router = new Router();
+
+
+
+////////////////////////////////
+//                            //
+//   Configure routes here    //
+//                            //
+////////////////////////////////
+
+router.addRoute('/api/dynamicContactDetails', {
+    GET: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        const isAuthenticated = authenticationResponse.status === true; // Check if authenticated
+        return await getAllContacts(dbClient, env, isAuthenticated);
+    },
+    POST: async (request, dbClient, env) => await createContact(request, dbClient, env),
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url)
+        const id = url.searchParams.get('id')
+        if (id) {
+            return await editContact(id, request, dbClient, env)
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        })
+    },
+    DELETE: async (request, dbClient, env) => {
+        const url = new URL(request.url)
+        const id = url.searchParams.get('id')
+        if (id) {
+            return await deleteContact(id, request, dbClient, env)
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        })
+    }
+});
+
+router.addRoute('/api/dynamicContactDetails/activate', {
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const id = url.searchParams.get('id');
+        if (id) {
+            return await activateContact(id, request, dbClient, env);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+});
+
+
+
+//  SECTION FOR BLOG ROUTES
+//  SECTION FOR BLOG ROUTES
+router.addRoute('/api/get-all-blogs', {
+    GET: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        if (!authenticationResponse.status) {
+            return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+        }
+        return await getAllBlogs(dbClient, env)
+    },
+});
+
+router.addRoute('/api/create-blogs', {
+    POST: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        if (!authenticationResponse.status) {
+            return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+        }
+        return await createBlog(request, dbClient, env);
+    }
+});
+
+router.addRoute('/api/getBlogById/:id', {
+    GET: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        if (!authenticationResponse.status) {
+            return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+        }
+        const { id } = request.params;
+        const result = await getBlogById(id, dbClient, env);
+        return new Response(result.body, {
+            status: result.status,
+            headers: result.headers,
+        });
+    },
+});
+
+router.addRoute('/api/createBlog', {
+    POST: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        if (!authenticationResponse.status) {
+            return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+        }
+        return await createBlog(request, dbClient, env);
+    },
+});
+
+router.addRoute('/api/updateBlog/:id', {
+    PUT: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        if (!authenticationResponse.status) {
+            return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+        }
+        const { id } = request.params;
+        return await updateBlog(id, request, dbClient, env);
+    },
+});
+
+router.addRoute('/api/deleteBlog/:id', {
+    DELETE: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        if (!authenticationResponse.status) {
+            return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+        }
+        const { id } = request.params;
+        return await deleteBlog(id, request, dbClient, env);
+    },
+});
+//public routes
+router.addRoute('/getBlogs', {
+    GET: async (request, dbClient, env) => {
+        return await getPublishedBlogs(dbClient, env, request);
+    },
+});
+
+router.addRoute('/getBlogs/:id', {
+    GET: async (request, dbClient, env) => {
+        const { id } = request.params;
+        return await getPublishedBlogById(id, dbClient, env);
+    },
+});
+
+//
+//
+// PRODUCTS
+//
+router.addRoute('/api/products', {
+    GET: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        const isAuthenticated = authenticationResponse.status === true; // Check if authenticated
+        return await getAllProducts(dbClient, env, isAuthenticated);
+    },
+    POST: async (request, dbClient, env) => await createProduct(request, dbClient, env),
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url)
+        const product_id = url.searchParams.get('id')
+        if (product_id) {
+            return await editProduct(request, dbClient, env, product_id)
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        })
+    },
+    DELETE: async (request, dbClient, env) => {
+        const url = new URL(request.url)
+        const product_id = url.searchParams.get('id')
+        if (product_id) {
+            return await deleteProduct(dbClient, request, env, product_id)
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        })
+    }
+});
+
+
+//
+//
+// BOARD of DIrectors and POPUPS
+//
+//
+
+// Popup Messages Routes
+router.addRoute('/api/popupMessages', {
+    GET: async (request, dbClient, env) => await getPopupMessages(request, dbClient, env),
+    POST: async (request, dbClient, env) => await createPopupMessage(request, dbClient, env),
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const popup_id = url.searchParams.get('id');
+        if (popup_id) {
+            return await editPopupMessage(request, dbClient, popup_id, env);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), { status: 400 });
+    },
+    DELETE: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const popup_id = url.searchParams.get('id');
+        if (popup_id) {
+            return await deletePopupMessage(request, dbClient, popup_id, env);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), { status: 400 });
+    }
+});
+
+router.addRoute('/api/popupMessages/status', {
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const popup_id = url.searchParams.get('id');
+        const authenticationResponse = await validateSession(request, env);
+        if (!authenticationResponse.status) {
+            return new Response(JSON.stringify(authenticationResponse), { status: 401 });
+        }
+        if (popup_id) {
+            return await setPopupActiveStatus(request, dbClient, popup_id);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), { status: 400 });
+    }
+});
+
+// Director  Definitions
+router.addRoute('/api/directors', {
+    GET: async (request, dbClient, env) => {
+        const authenticationResponse = await validateSession(request, env);
+        const isAuthenticated = authenticationResponse.status === true; // Check if authenticated
+        return await getAllDirectors(dbClient, env, isAuthenticated); // Pass authentication status
+    },
+    POST: async (request, dbClient, env) => await createDirector(request, dbClient, env),
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url)
+        const director_id = url.searchParams.get('id')
+        if (director_id) {
+            return await editDirector(request, dbClient, director_id, env)
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        })
+    },
+    DELETE: async (request, dbClient, env) => {
+        const url = new URL(request.url)
+        const director_id = url.searchParams.get('id')
+        if (director_id) {
+            return await deleteDirector(request, dbClient, director_id, env)
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        })
+    }
+});
+
+router.addRoute('/api/directors/status', {
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const director_id = url.searchParams.get('id');
+        if (director_id) {
+            return await setDirectorActiveStatus(request, dbClient, director_id, env);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        });
+    }
+});
+
+
+// API messages
+router.addRoute('/api/message', {
+    GET: async (request, dbClient, env) => await getAllMessages(request, dbClient, env), // Get all messages (authenticated)
+    POST: async (request, dbClient,ev) => await createMessage(request, dbClient),     // Create a message (unauthenticated)
+});
+
+router.addRoute('/api/message/:id', {
+    GET: async (request, dbClient, env) => {                                       // Get single message by ID (authenticated)
+        const messageId = parseInt(request.params.id);
+        if (isNaN(messageId)) {
+            return new Response(JSON.stringify({ error: "Invalid message ID" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+        return await getMessageById(request, messageId, dbClient, env);
+    },
+    // You can add PUT, DELETE handlers for /api/message/:id here if needed in the future.
+});
+
+
+//======================================================
+//                                                     ||
+//                 PUBLICATIONS                        ||
+//                                                     ||
+//======================================================
+
+
+// Route Definitions (Assuming you're using something like Alix Routers)
+router.addRoute('/api/publications', {
+    GET: async (request, dbClient, env) => await getPublications(request, dbClient, env),
+    POST: async (request, dbClient, env) => await createPublication(request, dbClient, env),
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const publication_id = url.searchParams.get('id');
+        if (publication_id) {
+            return await editPublication(request, dbClient, publication_id, env);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), { status: 400 });
+    },
+    DELETE: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const publication_id = url.searchParams.get('id');
+        if (publication_id) {
+            return await deletePublication(request, dbClient, publication_id, env);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), { status: 400 });
+    }
+});
+
+router.addRoute('/api/publications/status', {
+    PUT: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const publication_id = url.searchParams.get('id');
+        if (publication_id) {
+            return await setPublicationActiveStatus(request, dbClient, publication_id, env);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), { status: 400 });
+    }
+});
+
+
+// Assuming you have a router object like this
+router.addRoute('/api/login', {
+    POST: async (request, dbClient, env) => {
+        // Call the login function
+        return await login(request, dbClient, env);
+    }
+});
+
+// Check if signup is allowed in the environment configuration
+
+router.addRoute('/api/signup', {
+    POST: async (request, dbClient, env) => {
+        const allowSignup = env.ALLOW_SIGNUP === 'true';
+        if (allowSignup) {
+            console.log(allowSignup);
+            return await signup(request, dbClient);
+        } else {
+            return new Response(JSON.stringify({
+                error: "Signup is not allowed."
+            }), {
+                status: 403,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+    }
+});
+
+// In your router.js:
+router.addRoute('/api/validate-token', {
+    POST: async (request, dbClient, env) => {
+        const validationResult = await validateSession(request, env);
+        if (validationResult.status) {
+            return new Response(JSON.stringify({ message: "Token is valid", user: validationResult.user }), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+            });
+        } else {
+            return new Response(JSON.stringify({ error: "Token is invalid", details: validationResult.error }), {
+                status: 401,
+                headers: { "Content-Type": "application/json" },
+            });
+        }
+    }
+});
+
+// Add media routes
+router.addRoute('/api/media', {
+    GET: async (request, dbClient, env) => {
+        try {
+            const authenticationResponse = await validateSession(request, env);
+            const isAuthenticated = authenticationResponse.status;
+            
+            // Allow unauthenticated users to view public media
+            if (!isAuthenticated) {
+                return await getMedia(request, dbClient, env);
+            }
+            
+            // Authenticated users get full access
+            return await getMedia(request, dbClient, env);
+        } catch (error) {
+            console.error("Error in media GET route:", error);
+            return new Response(JSON.stringify({ 
+                error: "Failed to fetch media", 
+                details: error.message 
+            }), { 
+                status: 500,
+                headers: { "Content-Type": "application/json" }
+            });
+        }
+    },
+    POST: async (request, dbClient, env) => {
+        try {
+            const authenticationResponse = await validateSession(request, env);
+            if (!authenticationResponse.status) {
+                return new Response(JSON.stringify(authenticationResponse), { 
+                    status: 401,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+            return await createMedia(request, dbClient, env);
+        } catch (error) {
+            console.error("Error in media POST route:", error);
+            return new Response(JSON.stringify({ 
+                error: "Failed to create media", 
+                details: error.message 
+            }), { 
+                status: 500,
+                headers: { "Content-Type": "application/json" }
+            });
+        }
+    }
+});
+
+router.addRoute('/api/media/:id', {
+    PUT: async (request, dbClient, env) => {
+        try {
+            const authenticationResponse = await validateSession(request, env);
+            if (!authenticationResponse.status) {
+                return new Response(JSON.stringify(authenticationResponse), { 
+                    status: 401,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+            const { id } = request.params;
+            if (!id) {
+                return new Response(JSON.stringify({ 
+                    error: "Missing media ID" 
+                }), { 
+                    status: 400,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+            return await editMedia(request, dbClient, id, env);
+        } catch (error) {
+            console.error("Error in media PUT route:", error);
+            return new Response(JSON.stringify({ 
+                error: "Failed to update media", 
+                details: error.message 
+            }), { 
+                status: 500,
+                headers: { "Content-Type": "application/json" }
+            });
+        }
+    },
+    DELETE: async (request, dbClient, env) => {
+        try {
+            const authenticationResponse = await validateSession(request, env);
+            if (!authenticationResponse.status) {
+                return new Response(JSON.stringify(authenticationResponse), { 
+                    status: 401,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+            const { id } = request.params;
+            if (!id) {
+                return new Response(JSON.stringify({ 
+                    error: "Missing media ID" 
+                }), { 
+                    status: 400,
+                    headers: { "Content-Type": "application/json" }
+                });
+            }
+            return await deleteMedia(request, dbClient, id, env);
+        } catch (error) {
+            console.error("Error in media DELETE route:", error);
+            return new Response(JSON.stringify({ 
+                error: "Failed to delete media", 
+                details: error.message 
+            }), { 
+                status: 500,
+                headers: { "Content-Type": "application/json" }
+            });
+        }
+    }
+});
+
+////////////////////////////////
+//                            //
+//        Export Them         //
+//                            //
+////////////////////////////////
+
+module.exports = router;
+
+const jwt = require('jsonwebtoken');
+
+async function validateSession(request, env) {
+    try {
+        // Extract the Authorization header
+
+        const authHeader = request.headers.get('Authorization');
+
+
+
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return {
+                status: false,
+                error: "Missing or invalid Authorization header",
+                user: null
+            };
+        }
+
+        // Extract the token from the Authorization header
+        const token = authHeader.split(' ')[1];
+        console.log(token)
+        // Verify the token using your secret key
+        const decoded = jwt.verify(token, env.JWT_SECRET); // Replace 'env.JWT_SECRET' with your secret key
+
+        // If verification passes, return user details
+        console.log(`user:${decoded.userId}`)
+        return {
+            status: true,
+            user: {
+                id: decoded.userId,
+                role: decoded.role,
+                username: decoded.username
+            }
+        };
+    } catch (error) {
+        // If verification fails, return the invalid JWT (or null if it's missing)
+        // console.log(error)
+        return {
+            status: false,
+            error: error.message,
+            user: null
+        };
+    }
+}
+
+module.exports = validateSession;
+
