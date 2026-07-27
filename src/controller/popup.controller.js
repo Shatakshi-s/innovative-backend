@@ -15,6 +15,9 @@ async function createPopupMessage(request, dbClient, env) {
         const start_date = formData.get('start_date');
         const end_date = formData.get('end_date');
 
+        const start_date_val = (start_date && start_date.trim() !== '') ? start_date : null;
+        const end_date_val = (end_date && end_date.trim() !== '') ? end_date : null;
+
         if (!title || !content) {
             return new Response(JSON.stringify({ error: "Missing required fields: title and content" }), { status: 400 });
         }
@@ -39,7 +42,7 @@ async function createPopupMessage(request, dbClient, env) {
             RETURNING popup_id;
         `;
 
-        const result = await dbClient.execute(query, [title, content, imageName, alt_text || null, start_date || null, end_date || null]);
+        const result = await dbClient.execute(query, [title, content, imageName, alt_text || null, start_date_val, end_date_val]);
         const popup_id = result.rows[0].popup_id;
 
         return new Response(JSON.stringify({ message: "Popup message created successfully", popup_id }), { status: 201 });
@@ -65,6 +68,9 @@ async function editPopupMessage(request, dbClient, popup_id, env) {
         const start_date = formData.get('start_date');
         const end_date = formData.get('end_date');
         const deleteImage = formData.get('deleteImage') === 'true';
+
+        const start_date_val = (start_date && start_date.trim() !== '') ? start_date : null;
+        const end_date_val = (end_date && end_date.trim() !== '') ? end_date : null;
 
         // Get existing data for the blog post
         const existingPopupQuery = `SELECT image_name FROM PopupMessages WHERE popup_id = ?`;
@@ -105,7 +111,7 @@ async function editPopupMessage(request, dbClient, popup_id, env) {
             WHERE popup_id = ?;
         `;
 
-        await dbClient.execute(query, [title, content, imageName, alt_text || null, start_date || null, end_date || null, popup_id]);
+        await dbClient.execute(query, [title, content, imageName, alt_text || null, start_date_val, end_date_val, popup_id]);
 
         return new Response(JSON.stringify({ message: "Popup message updated successfully" }), { status: 200 });
 
@@ -160,8 +166,8 @@ async function getPopupMessages(request, dbClient, env) {
         if (!isAuthenticated) {
             query += `
             WHERE active = 1 AND
-                  (start_date IS NULL OR start_date <= CURRENT_TIMESTAMP) AND
-                  (end_date IS NULL OR end_date >= CURRENT_TIMESTAMP)
+                  (start_date IS NULL OR datetime(start_date) <= datetime('now')) AND
+                  (end_date IS NULL OR datetime(end_date) >= datetime('now'))
         `;
         }
 
