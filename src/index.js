@@ -19,6 +19,16 @@ async function ensureTables(dbClient) {
 				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 			);
 		`);
+		await dbClient.execute(`
+			CREATE TABLE IF NOT EXISTS suggestions (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				name TEXT NOT NULL,
+				email TEXT NOT NULL,
+				message TEXT NOT NULL,
+				read INTEGER DEFAULT 0,
+				created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			);
+		`);
 		dbInitialized = true;
 	} catch (error) {
 		console.error("Failed to initialize database tables:", error);

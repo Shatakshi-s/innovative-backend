@@ -13,6 +13,7 @@ const { activateContact, createContact, editContact, viewContact, deleteContact,
 const { createPopupMessage, getPopupMessages, editPopupMessage, deletePopupMessage, setPopupActiveStatus } = require('../controller/popup.controller');
 const { createProduct, getAllProducts, editProduct, deleteProduct } = require('../controller/product.controller')
 const { getAllMessages, getMessageById, createMessage, deleteMessageById, updateMessageStatus } = require('../controller/message.controller');
+const { getAllSuggestions, getSuggestionById, createSuggestion, deleteSuggestionById, updateSuggestionStatus } = require('../controller/suggestion.controller');
 const { createPublication, getPublications, editPublication, deletePublication, setPublicationActiveStatus } = require("../controller/publications.controller")
 const { createMedia, getMedia, editMedia, deleteMedia } = require('../controller/media.controller');
 const { getDashboardSummary } = require('../controller/dashboard.controller');
@@ -397,6 +398,38 @@ router.addRoute('/api/message/:id', {
             return new Response(JSON.stringify({ error: "Invalid message ID" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
         return await deleteMessageById(request, messageId, dbClient, env);
+    },
+});
+
+// API suggestions
+router.addRoute('/api/suggestion', {
+    GET: async (request, dbClient, env) => await getAllSuggestions(request, dbClient, env), // Get all suggestions (authenticated)
+    POST: async (request, dbClient) => await createSuggestion(request, dbClient),            // Create a suggestion (unauthenticated)
+});
+
+router.addRoute('/api/suggestion/:id', {
+    GET: async (request, dbClient, env) => {
+        const suggestionId = parseInt(request.params.id);
+        if (isNaN(suggestionId)) {
+            return new Response(JSON.stringify({ error: "Invalid suggestion ID" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+        return await getSuggestionById(request, suggestionId, dbClient, env);
+    },
+
+    PUT: async (request, dbClient, env) => {
+        const suggestionId = parseInt(request.params.id);
+        if (isNaN(suggestionId)) {
+            return new Response(JSON.stringify({ error: "Invalid suggestion ID" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+        return await updateSuggestionStatus(request, suggestionId, dbClient, env);
+    },
+
+    DELETE: async (request, dbClient, env) => {
+        const suggestionId = parseInt(request.params.id);
+        if (isNaN(suggestionId)) {
+            return new Response(JSON.stringify({ error: "Invalid suggestion ID" }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+        }
+        return await deleteSuggestionById(request, suggestionId, dbClient, env);
     },
 });
 
