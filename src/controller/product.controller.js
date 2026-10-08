@@ -1,5 +1,19 @@
 import validateSession from "../utils/validateSession.controller";
 
+const parseCategoryIds = (rawCategories) => {
+    if (!rawCategories) return [];
+    try {
+        const parsed = JSON.parse(rawCategories);
+        if (Array.isArray(parsed)) return parsed.map(id => Number(id)).filter(id => !isNaN(id));
+    } catch (e) {
+        // Fallback for comma separated string
+    }
+    if (typeof rawCategories === 'string') {
+        return rawCategories.split(',').map(id => Number(id.trim())).filter(id => !isNaN(id));
+    }
+    return [];
+};
+
 const createProduct = async (request, dbClient, env) => {
     const authenticationResponse = await validateSession(request, env);
     if (!authenticationResponse.status) {
@@ -15,6 +29,8 @@ const createProduct = async (request, dbClient, env) => {
         const rating = parseFloat(formData.get('rating')) || 0;
         const review_count = parseInt(formData.get('review_count')) || 0;
         const available = formData.get('available') === 'true';
+        const rawCategories = formData.get('category_ids');
+        const categoryIds = parseCategoryIds(rawCategories);
 
         if (!name || isNaN(price)) {
             return new Response(JSON.stringify({
@@ -38,12 +54,11 @@ const createProduct = async (request, dbClient, env) => {
             }
         }
 
-
         const query = `
             INSERT INTO products (name, description, price, image_name, alt_text, rating, review_count, available)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `;
-        await dbClient.execute(query, [
+        const insertResult = await dbClient.execute(query, [
             name,
             description || null,
             price,
@@ -54,8 +69,26 @@ const createProduct = async (request, dbClient, env) => {
             available,
         ]);
 
+        let newProductId = insertResult.lastInsertRowid ? Number(insertResult.lastInsertRowid) : null;
+        if (!newProductId) {
+            const fetchIdResult = await dbClient.execute(`SELECT product_id FROM products ORDER BY product_id DESC LIMIT 1`);
+            if (fetchIdResult.rows && fetchIdResult.rows.length > 0) {
+                newProductId = Number(fetchIdResult.rows[0].product_id);
+            }
+        }
+
+        if (newProductId && categoryIds.length > 0) {
+            for (const catId of categoryIds) {
+                await dbClient.execute(
+                    `INSERT OR IGNORE INTO product_categories (product_id, category_id) VALUES (?, ?)`,
+                    [newProductId, Number(catId)]
+                );
+            }
+        }
+
         return new Response(JSON.stringify({
             message: "Product created successfully!",
+            product_id: newProductId
         }), {
             status: 201,
             headers: { "Content-Type": "application/json" },
@@ -84,10 +117,41 @@ const getAllProducts = async (dbClient, env, isAuthenticated) => {
         query += whereClause + ' ORDER BY created_at DESC';
 
         const result = await dbClient.execute(query, params);
-        const products = result.rows.map(row => ({
-            ...row,
-            image_url: row.image_name ? `${env.R2_PUBLIC_URL}/${row.image_name}` : null,
-        }));
+
+        // Fetch categories for all products
+        let productCategoriesMap = {};
+        try {
+            const catQuery = `
+                SELECT pc.product_id, c.category_id, c.name, c.slug 
+                FROM product_categories pc 
+                JOIN categories c ON pc.category_id = c.category_id
+            `;
+            const catResult = await dbClient.execute(catQuery);
+            if (catResult.rows) {
+                catResult.rows.forEach(row => {
+                    const pId = Number(row.product_id);
+                    if (!productCategoriesMap[pId]) {
+                        productCategoriesMap[pId] = [];
+                    }
+                    productCategoriesMap[pId].push({
+                        category_id: Number(row.category_id),
+                        name: String(row.name),
+                        slug: String(row.slug)
+                    });
+                });
+            }
+        } catch (catErr) {
+            console.error("Failed to load product categories:", catErr);
+        }
+
+        const products = result.rows.map(row => {
+            const pId = Number(row.product_id);
+            return {
+                ...row,
+                image_url: row.image_name ? `${env.R2_PUBLIC_URL}/${row.image_name}` : null,
+                categories: productCategoriesMap[pId] || []
+            };
+        });
 
         return new Response(JSON.stringify({
             message: "Products fetched successfully!",
@@ -123,7 +187,8 @@ const editProduct = async (request, dbClient, env, product_id) => {
         const rating = parseFloat(formData.get('rating')) || 0;
         const review_count = parseInt(formData.get('review_count')) || 0;
         const available = formData.get('available') === 'true';
-        const deleteImage = formData.get('delete_image') === 'true'; // New field
+        const deleteImage = formData.get('delete_image') === 'true';
+        const rawCategories = formData.get('category_ids');
 
         if (!name || isNaN(price)) {
             return new Response(JSON.stringify({
@@ -147,7 +212,7 @@ const editProduct = async (request, dbClient, env, product_id) => {
                 return new Response(JSON.stringify({ error: "Image upload to R2 failed" }), { status: 500 });
             }
         } else if (deleteImage) {
-            imageName = null;  // Explicitly set image_name to NULL if the user wants to delete the image
+            imageName = null;
         }
 
         const query = `
@@ -166,6 +231,17 @@ const editProduct = async (request, dbClient, env, product_id) => {
             available,
             product_id,
         ]);
+
+        if (rawCategories !== null) {
+            const categoryIds = parseCategoryIds(rawCategories);
+            await dbClient.execute(`DELETE FROM product_categories WHERE product_id = ?`, [product_id]);
+            for (const catId of categoryIds) {
+                await dbClient.execute(
+                    `INSERT OR IGNORE INTO product_categories (product_id, category_id) VALUES (?, ?)`,
+                    [product_id, Number(catId)]
+                );
+            }
+        }
 
         return new Response(JSON.stringify({
             message: "Product updated successfully!",
@@ -190,7 +266,6 @@ const deleteProduct = async (dbClient, request, env, product_id) => {
         return new Response(JSON.stringify(authenticationResponse), { status: 401 });
     }
     try {
-        // Get the current product to access the image name for deletion
         const getProductQuery = `SELECT image_name FROM products WHERE product_id = ?`;
         const productResult = await dbClient.execute(getProductQuery, [product_id]);
 
@@ -200,7 +275,6 @@ const deleteProduct = async (dbClient, request, env, product_id) => {
 
         const imageName = productResult.rows[0].image_name;
 
-        // Delete the image from R2 if it exists
         if (imageName) {
             await env.KRISHI_BUCKET.delete(imageName);
         }

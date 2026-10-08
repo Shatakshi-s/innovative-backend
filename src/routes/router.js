@@ -12,6 +12,7 @@ const { createDirector, editDirector, deleteDirector, getAllDirectors, setDirect
 const { activateContact, createContact, editContact, viewContact, deleteContact, getActiveContact, getAllContacts } = require('../controller/contact.controller');
 const { createPopupMessage, getPopupMessages, editPopupMessage, deletePopupMessage, setPopupActiveStatus } = require('../controller/popup.controller');
 const { createProduct, getAllProducts, editProduct, deleteProduct } = require('../controller/product.controller')
+const { getAllCategories, createCategory, deleteCategory } = require('../controller/category.controller');
 const { getAllMessages, getMessageById, createMessage, deleteMessageById, updateMessageStatus } = require('../controller/message.controller');
 const { getAllSuggestions, getSuggestionById, createSuggestion, deleteSuggestionById, updateSuggestionStatus } = require('../controller/suggestion.controller');
 const { createPublication, getPublications, editPublication, deletePublication, setPublicationActiveStatus } = require("../controller/publications.controller")
@@ -275,6 +276,29 @@ router.addRoute('/api/products', {
             status: 400,
             headers: { "Content-Type": "application/json" },
         })
+    }
+});
+
+//
+// CATEGORIES
+//
+router.addRoute('/api/categories', {
+    GET: async (request, dbClient, env) => {
+        return await getAllCategories(dbClient, env);
+    },
+    POST: async (request, dbClient, env) => {
+        return await createCategory(request, dbClient, env);
+    },
+    DELETE: async (request, dbClient, env) => {
+        const url = new URL(request.url);
+        const category_id = url.searchParams.get('id');
+        if (category_id) {
+            return await deleteCategory(request, dbClient, env, category_id);
+        }
+        return new Response(JSON.stringify({ error: "Missing id parameter" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+        });
     }
 });
 
